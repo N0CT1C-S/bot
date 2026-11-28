@@ -8,6 +8,7 @@ from pathlib import Path
 
 from google import genai
 from google.genai import types
+from gtts import gTTS
 from neonize.client import NewClient
 from neonize.events import ConnectedEv, MessageEv
 from PIL import Image
@@ -47,8 +48,10 @@ MENU_TEXT = """*SIGMA BOT*
 
 *Daftar Perintah:*
 - `.menu` — Menampilkan daftar perintah
-- `.ai <pertanyaan>` — Tanya jawab teks, gambar, atau video (maks 20 MB)
-- `.dl <link>` — Download video TikTok, IG Reels, atau YT Shorts (maks 63 MB)
+- `.ai <pertanyaan>` — Tanya AI (teks, gambar, video, PDF, atau reply VN)
+- `.dl <link>` — Download video TikTok, IG Reels, atau YT Shorts
+- `.play` / `.ytmp3 <judul/link>` — Cari & download lagu MP3 dari YouTube
+- `.tts <teks>` — Ubah teks menjadi Voice Note (VN)
 - `.stiker` / `.s` — Ubah gambar atau video menjadi stiker
 - `.gif` — Ubah video menjadi GIF tanpa suara
 - `.mp3` — Ekstrak audio MP3 dari video yang di-reply
@@ -74,7 +77,7 @@ def tanya_ai(
     media_bytes: bytes | None = None,
     mime_type: str | None = None,
 ) -> str:
-    """Memakai model Gemini untuk menjawab pertanyaan teks, gambar, atau video."""
+    """Memakai model Gemini untuk menjawab pertanyaan teks, gambar, video, audio, atau PDF."""
     preferred_models = [
         "gemini-2.5-flash",
         "gemini-2.5-flash-lite",
@@ -260,6 +263,94 @@ def download_video_sosmed(url: str) -> bytes:
         )
 
 
+def download_audio_youtube(query_or_url: str) -> bytes:
+    """Mencari judul lagu atau mengunduh audio dari link YouTube menjadi MP3."""
+    target = (
+        query_or_url
+        if query_or_url.startswith(("http://", "https://"))
+        else f"ytsearch1:{query_or_url}"
+    )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_template = os.path.join(tmp_dir, "lagu.%(ext)s")
+
+        result = run_command(
+            [
+                "yt-dlp",
+                "--no-playlist",
+                "--max-filesize",
+                "60M",
+                "-x",
+                "--audio-format",
+                "mp3",
+                "--audio-quality",
+                "2",
+                "-o",
+                output_template,
+                target,
+            ]
+        )
+
+        mp3_files = list(Path(tmp_dir).glob("lagu*.mp3"))
+        if result.returncode != 0 or not mp3_files:
+            raise MediaProcessError(
+                "Gagal mengunduh lagu. Coba kata kunci atau link YouTube lain."
+            )
+
+        mp3_file = mp3_files[0]
+        if mp3_file.stat().st_size > 60 * 1024 * 1024:
+            raise MediaProcessError("Ukuran file audio melebihi batas 60 MB.")
+
+        return mp3_file.read_bytes()
+
+def teks_ke_vn_mp3(text: str, lang: str = "id") -> bytes:
+    """Mengubah teks menjadi MP3 dengan tag ID3 agar terbaca neonize sebagai Voice Note."""
+    temporary_files: list[str] = []
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+            raw_mp3 = f.name
+
+        final_mp3 = f"{raw_mp3}_vn.mp3"
+        temporary_files.extend([raw_mp3, final_mp3])
+
+        tts = gTTS(text=text, lang=lang, slow=False)
+        tts.save(raw_mp3)
+
+        result = run_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                raw_mp3,
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                "-ar",
+                "24000",
+                "-ac",
+                "1",
+                "-id3v2_version",
+                "3",
+                "-metadata",
+                "title=SIGMA BOT",
+                final_mp3,
+            ]
+        )
+
+        if result.returncode != 0 or not os.path.exists(final_mp3):
+            raise MediaProcessError(f"Gagal memproses audio TTS: {result.stderr}")
+
+        return Path(final_mp3).read_bytes()
+
+    finally:
+        for path in temporary_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
 def gambar_ke_webp(raw_bytes: bytes) -> bytes:
     try:
         image = Image.open(io.BytesIO(raw_bytes)).convert("RGBA")
@@ -436,15 +527,21 @@ def video_ke_mp3(raw_bytes: bytes) -> bytes:
                 pass
 
 
-def kirim_mp3_dari_video(c: NewClient, chat, target_video, event: MessageEv) -> None:
+def kirim_audio_bytes(
+    c: NewClient,
+    chat,
+    audio_bytes: bytes,
+    suffix: str,
+    ptt: bool,
+    event: MessageEv,
+) -> None:
     audio_tmp = None
     try:
-        audio_bytes = video_ke_mp3(c.download_any(target_video))
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(audio_bytes)
             audio_tmp = f.name
 
-        c.send_audio(chat, audio_tmp, ptt=False, quoted=event)
+        c.send_audio(chat, audio_tmp, ptt=ptt, quoted=event)
     finally:
         if audio_tmp and os.path.exists(audio_tmp):
             try:
@@ -489,13 +586,16 @@ def handle_message(c: NewClient, event: MessageEv):
         or message.extendedTextMessage.text
         or message.imageMessage.caption
         or message.videoMessage.caption
+        or message.documentMessage.caption
         or ""
     ).strip()
 
+    # Otomatis ubah video menjadi audio MP3 jika dikirim tanpa caption
     if not text:
         if message.HasField("videoMessage"):
             try:
-                kirim_mp3_dari_video(c, chat, message, event)
+                mp3_bytes = video_ke_mp3(c.download_any(message))
+                kirim_audio_bytes(c, chat, mp3_bytes, ".mp3", False, event)
             except Exception as error:
                 logger.exception("Gagal mengekstrak audio video")
                 c.reply_message(f"Gagal mengekstrak suara: {error}", event)
@@ -541,6 +641,43 @@ def handle_message(c: NewClient, event: MessageEv):
             c.reply_message(f"{error}", event)
         return
 
+    if command in (".play", "!play", ".ytmp3", "!ytmp3") or command.startswith(
+        (".play ", "!play ", ".ytmp3 ", "!ytmp3 ")
+    ):
+        query = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+        if not query:
+            c.reply_message(
+                "Contoh:\n- `.play judul lagu`\n- `.ytmp3 https://youtu.be/...`",
+                event,
+            )
+            return
+
+        try:
+            c.reply_message("Sedang mencari dan mengunduh lagu...", event)
+            mp3_bytes = download_audio_youtube(query)
+            kirim_audio_bytes(c, chat, mp3_bytes, ".mp3", False, event)
+        except Exception as error:
+            logger.exception("Gagal download audio YouTube")
+            c.reply_message(f"{error}", event)
+        return
+
+    if command in (".tts", "!tts") or command.startswith((".tts ", "!tts ")):
+        tts_text = text[4:].strip()
+        if not tts_text:
+            c.reply_message("Contoh: `.tts halo bro apa kabar`", event)
+            return
+
+        if len(tts_text) > 500:
+            c.reply_message("Teks TTS terlalu panjang (maksimal 500 karakter).", event)
+            return
+
+        try:
+            vn_bytes = teks_ke_vn_mp3(tts_text, lang="id")
+            kirim_audio_bytes(c, chat, vn_bytes, ".mp3", True, event)
+        except Exception as error:
+            logger.exception("Gagal membuat VN TTS")
+            c.reply_message(f"Gagal membuat Voice Note: {error}", event)
+
     if command in (".ai", "!ai") or command.startswith((".ai ", "!ai ")):
         question = text[3:].strip()
         target = ambil_target_media(message)
@@ -566,9 +703,45 @@ def handle_message(c: NewClient, event: MessageEv):
                 c.reply_message(tanya_ai(prompt, media_bytes=media_bytes, mime_type=mime), event)
                 return
 
+            if target.HasField("audioMessage"):
+                media_bytes = c.download_any(target)
+                if len(media_bytes) > 20 * 1024 * 1024:
+                    c.reply_message("Ukuran audio melebihi batas maksimal Gemini API (20 MB).", event)
+                    return
+                mime = target.audioMessage.mimetype or "audio/ogg"
+                prompt = question or (
+                    "Tuliskan transkrip isi pesan suara ini dengan rapi, lalu buat ringkasan "
+                    "poin pentingnya secara singkat dan jelas."
+                )
+                c.reply_message(tanya_ai(prompt, media_bytes=media_bytes, mime_type=mime), event)
+                return
+
+            if target.HasField("documentMessage"):
+                mime = target.documentMessage.mimetype or ""
+                file_name = (target.documentMessage.fileName or "").lower()
+                if "pdf" not in mime.lower() and not file_name.endswith(".pdf"):
+                    c.reply_message("Saat ini perintah `.ai` hanya mendukung dokumen berformat PDF.", event)
+                    return
+
+                media_bytes = c.download_any(target)
+                if len(media_bytes) > 20 * 1024 * 1024:
+                    c.reply_message("Ukuran file PDF melebihi batas maksimal Gemini API (20 MB).", event)
+                    return
+
+                prompt = question or (
+                    "Rangkum isi dokumen PDF ini secara terstruktur, jelas, dan mudah dipahami."
+                )
+                c.reply_message(
+                    tanya_ai(prompt, media_bytes=media_bytes, mime_type="application/pdf"),
+                    event,
+                )
+                return
+
             if not question:
                 c.reply_message(
-                    "Contoh:\n- `.ai jelaskan cara kerja subnetting`\n- Kirim/reply gambar atau video dengan `.ai apa isi media ini?`",
+                    "Contoh:\n"
+                    "- `.ai jelaskan cara kerja subnetting`\n"
+                    "- Kirim/reply gambar, video, Voice Note, atau file PDF dengan `.ai`",
                     event,
                 )
                 return
@@ -615,7 +788,8 @@ def handle_message(c: NewClient, event: MessageEv):
         target = ambil_target_media(message)
         try:
             if target.HasField("videoMessage"):
-                kirim_mp3_dari_video(c, chat, target, event)
+                mp3_bytes = video_ke_mp3(c.download_any(target))
+                kirim_audio_bytes(c, chat, mp3_bytes, ".mp3", False, event)
             else:
                 c.reply_message("Kirim atau reply video untuk diubah menjadi audio MP3.", event)
         except Exception as error:
