@@ -5,3 +5,9 @@ __pycache__/
 *.ogg
 *.mp4
 *.webp
+.env
+*.sqlite3
+*.sqlite3*
+*.db
+__pycache__/
+venv/
